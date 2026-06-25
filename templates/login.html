@@ -1,0 +1,138 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Sign in · Amber LinkedIn Post Scraper</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com" />
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&display=swap" rel="stylesheet" />
+  <style>
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+    body {
+      font-family: 'Inter', -apple-system, BlinkMacSystemFont, sans-serif;
+      min-height: 100vh;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      background: linear-gradient(135deg, #1a0410 0%, #3d0a26 50%, #6d0f3f 100%);
+      padding: 24px;
+    }
+    .login-card {
+      width: 100%;
+      max-width: 400px;
+      background: #fff;
+      border-radius: 20px;
+      padding: 40px 36px;
+      box-shadow: 0 24px 70px rgba(0, 0, 0, 0.4);
+    }
+    .brand {
+      display: flex;
+      align-items: center;
+      gap: 12px;
+      margin-bottom: 28px;
+    }
+    .brand-icon {
+      width: 44px;
+      height: 44px;
+      border-radius: 12px;
+      background: linear-gradient(135deg, #e11d74, #b91c5c);
+      display: flex;
+      align-items: center;
+      justify-content: center;
+    }
+    .brand-name { font-size: 22px; font-weight: 800; color: #1a0410; line-height: 1; }
+    .brand-sub { font-size: 12px; font-weight: 500; color: #9ca3af; }
+    h1 { font-size: 19px; font-weight: 700; color: #111827; margin-bottom: 4px; }
+    .subtitle { font-size: 13px; color: #6b7280; margin-bottom: 24px; }
+    label {
+      display: block;
+      font-size: 13px;
+      font-weight: 600;
+      color: #374151;
+      margin-bottom: 6px;
+    }
+    .field { margin-bottom: 16px; }
+    input {
+      width: 100%;
+      padding: 12px 14px;
+      font-size: 14px;
+      font-family: inherit;
+      border: 1.5px solid #e5e7eb;
+      border-radius: 10px;
+      outline: none;
+      transition: border-color .15s, box-shadow .15s;
+    }
+    input:focus {
+      border-color: #e11d74;
+      box-shadow: 0 0 0 3px rgba(225, 29, 116, 0.12);
+    }
+    button {
+      width: 100%;
+      margin-top: 8px;
+      padding: 13px;
+      font-size: 14px;
+      font-weight: 700;
+      font-family: inherit;
+      color: #fff;
+      background: linear-gradient(135deg, #e11d74, #b91c5c);
+      border: none;
+      border-radius: 10px;
+      cursor: pointer;
+      box-shadow: 0 4px 18px rgba(225, 29, 116, 0.4);
+      transition: transform .1s, box-shadow .15s;
+    }
+    button:hover { box-shadow: 0 6px 24px rgba(225, 29, 116, 0.5); }
+    button:active { transform: translateY(1px); }
+    .error {
+      background: #fef2f2;
+      border: 1px solid #fecaca;
+      color: #b91c1c;
+      font-size: 13px;
+      padding: 10px 12px;
+      border-radius: 9px;
+      margin-bottom: 18px;
+      display: flex;
+      align-items: center;
+      gap: 8px;
+    }
+  </style>
+</head>
+<body>
+  <div class="login-card">
+    <div class="brand">
+      <div class="brand-icon">
+        <svg width="22" height="22" viewBox="0 0 24 24" fill="none">
+          <path d="M12 3C7 3 3 7 3 12s4 9 9 9 9-4 9-9" stroke="white" stroke-width="2.2" stroke-linecap="round"/>
+          <path d="M15 8a5 5 0 11-6 7.5" stroke="white" stroke-width="2.2" stroke-linecap="round"/>
+        </svg>
+      </div>
+      <div>
+        <div class="brand-name">amber</div>
+        <div class="brand-sub">Post Scraper</div>
+      </div>
+    </div>
+
+    <h1>Sign in</h1>
+    <p class="subtitle">Enter your credentials to access the tool.</p>
+
+    {% if error %}
+    <div class="error">
+      <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><circle cx="12" cy="12" r="10"/><line x1="12" y1="8" x2="12" y2="12"/><line x1="12" y1="16" x2="12.01" y2="16"/></svg>
+      {{ error }}
+    </div>
+    {% endif %}
+
+    <form method="POST" action="{{ url_for('login') }}">
+      <div class="field">
+        <label for="username">Username</label>
+        <input type="text" id="username" name="username" autocomplete="username" required autofocus />
+      </div>
+      <div class="field">
+        <label for="password">Password</label>
+        <input type="password" id="password" name="password" autocomplete="current-password" required />
+      </div>
+      <button type="submit">Sign in</button>
+    </form>
+  </div>
+</body>
+</html>

@@ -1,0 +1,25 @@
+services:
+  - type: web
+    name: linkedin-post-scraper
+    runtime: python
+    plan: free
+    buildCommand: pip install -r requirements.txt
+    # gthread worker + long timeout so streaming (SSE) scrape runs don't get killed
+    startCommand: gunicorn app:app --workers 1 --threads 8 --worker-class gthread --timeout 600 --bind 0.0.0.0:$PORT
+    healthCheckPath: /health
+    envVars:
+      - key: PYTHON_VERSION
+        value: "3.13.4"
+      # Generated automatically by Render — used to sign session cookies
+      - key: SECRET_KEY
+        generateValue: true
+      # Login credentials (change these for production)
+      - key: APP_USERNAME
+        value: Amber
+      - key: APP_PASSWORD
+        value: Amber@123
+      # Secrets — set these in the Render dashboard (sync:false = not stored in repo)
+      - key: APIFY_API_TOKEN
+        sync: false
+      - key: GOOGLE_CREDENTIALS_JSON
+        sync: false

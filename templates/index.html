@@ -1,0 +1,284 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Amber · LinkedIn Post Scraper</title>
+  <link rel="stylesheet" href="/static/css/style.css?v=12" />
+  <link rel="preconnect" href="https://fonts.googleapis.com" />
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&display=swap" rel="stylesheet" />
+</head>
+<body>
+
+  <!-- Header -->
+  <header class="header">
+    <div class="header-inner">
+      <a class="logo" href="/">
+        <div class="logo-icon">
+          <svg width="20" height="20" viewBox="0 0 24 24" fill="none">
+            <path d="M12 3C7 3 3 7 3 12s4 9 9 9 9-4 9-9" stroke="white" stroke-width="2.2" stroke-linecap="round"/>
+            <path d="M15 8a5 5 0 11-6 7.5" stroke="white" stroke-width="2.2" stroke-linecap="round"/>
+          </svg>
+        </div>
+        <div class="logo-wordmark">
+          <span class="logo-name">amber</span>
+          <span class="logo-sub">Post Scraper</span>
+        </div>
+      </a>
+      <div style="display:flex;align-items:center;gap:14px;">
+        <span class="header-badge">
+          <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><polygon points="13 2 3 14 12 14 11 22 21 10 12 10 13 2"/></svg>
+          Powered by Apify
+        </span>
+        <a href="/logout" class="header-badge" style="text-decoration:none;cursor:pointer;">
+          <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><path d="M9 21H5a2 2 0 01-2-2V5a2 2 0 012-2h4"/><polyline points="16 17 21 12 16 7"/><line x1="21" y1="12" x2="9" y2="12"/></svg>
+          Logout
+        </a>
+      </div>
+    </div>
+  </header>
+
+  <!-- Hero -->
+  <div class="hero-band">
+    <div class="hero-inner">
+      <div class="hero-text">
+        <h1>LinkedIn Post Intelligence</h1>
+        <p>Upload one Excel file with profiles &amp; keywords. Get a single output file with 3 result tabs.</p>
+      </div>
+      <div class="hero-stats">
+        <div class="stat"><span class="stat-num">1</span><span class="stat-label">Upload</span></div>
+        <div class="stat-divider"></div>
+        <div class="stat"><span class="stat-num">3</span><span class="stat-label">Result tabs</span></div>
+        <div class="stat-divider"></div>
+        <div class="stat"><span class="stat-num">📁</span><span class="stat-label">Excel in/out</span></div>
+      </div>
+    </div>
+  </div>
+
+  <!-- Main -->
+  <main class="main">
+
+    <!-- Single form card -->
+    <section class="form-card">
+      <div class="form-card-header">
+        <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M14 2H6a2 2 0 00-2 2v16a2 2 0 002 2h12a2 2 0 002-2V8z"/><polyline points="14 2 14 8 20 8"/></svg>
+        <span>Upload Input File</span>
+      </div>
+      <div class="form-body">
+
+        <div class="upload-section">
+          <p class="upload-desc">Upload a single <strong>.xlsx</strong> file with two tabs:</p>
+          <ul class="upload-specs">
+            <li><strong>Tab 1 — Profiles</strong>: LinkedIn profile/company URLs (column A)</li>
+            <li><strong>Tab 2 — Keywords</strong>: Search keywords (column A)</li>
+          </ul>
+        </div>
+
+        <!-- Input source toggle -->
+        <div class="input-source-tabs">
+          <button class="src-tab active" id="srcExcel">📁 Excel File</button>
+          <button class="src-tab" id="srcSheet">📊 Google Sheet</button>
+        </div>
+
+        <!-- Excel input -->
+        <div id="excelInput">
+          <div class="upload-row">
+            <input type="file" id="inputFile" accept=".xlsx,.xls" class="file-input" />
+          </div>
+          <div class="form-row">
+            <div class="form-group">
+              <label>Profiles tab name</label>
+              <input type="text" id="profilesTabName" class="text-input" placeholder="profiles" value="profiles" />
+            </div>
+            <div class="form-group">
+              <label>Keywords tab name</label>
+              <input type="text" id="keywordsTabName" class="text-input" placeholder="keywords" value="keywords" />
+            </div>
+          </div>
+        </div>
+
+        <!-- Google Sheet input -->
+        <div id="sheetInput" hidden>
+          <div class="form-group">
+            <label>Google Sheet URL</label>
+            <input type="url" id="inputSheetUrl" class="text-input" placeholder="https://docs.google.com/spreadsheets/d/..." />
+          </div>
+          <div class="form-row">
+            <div class="form-group">
+              <label>Profiles tab name</label>
+              <input type="text" id="sheetProfilesTab" class="text-input" placeholder="profiles" value="profiles" />
+            </div>
+            <div class="form-group">
+              <label>Keywords tab name</label>
+              <input type="text" id="sheetKeywordsTab" class="text-input" placeholder="keywords" value="keywords" />
+            </div>
+          </div>
+          <p class="sheet-hint">Sheet must be shared with the service account email.</p>
+        </div>
+
+        <div class="form-row">
+          <div class="form-group">
+            <label for="maxPosts">Posts per profile</label>
+            <div class="select-wrap">
+              <select id="maxPosts">
+                <option value="3">3 posts</option>
+                <option value="5" selected>5 posts</option>
+                <option value="10">10 posts</option>
+                <option value="20">20 posts</option>
+                <option value="50">50 posts</option>
+              </select>
+              <svg class="select-chevron" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><path d="M6 9l6 6 6-6"/></svg>
+            </div>
+          </div>
+          <div class="form-group">
+            <label for="kwLimit">Keyword results limit</label>
+            <div class="select-wrap">
+              <select id="kwLimit">
+                <option value="10">10 per keyword</option>
+                <option value="20" selected>20 per keyword</option>
+                <option value="50">50 per keyword</option>
+              </select>
+              <svg class="select-chevron" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><path d="M6 9l6 6 6-6"/></svg>
+            </div>
+          </div>
+        </div>
+
+        <div class="form-row">
+          <div class="form-group">
+            <label for="kwDate">Keyword date filter</label>
+            <div class="select-wrap">
+              <select id="kwDate">
+                <option value="ignore">All time</option>
+                <option value="last-1-day">Last 24h</option>
+                <option value="last-1-week" selected>Last week</option>
+                <option value="last-2-weeks">Last 2 weeks</option>
+                <option value="last-1-month">Last month</option>
+              </select>
+              <svg class="select-chevron" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><path d="M6 9l6 6 6-6"/></svg>
+            </div>
+          </div>
+        </div>
+
+        <!-- Preview -->
+        <div id="preview" class="loaded-preview" hidden>
+          <div class="preview-header">
+            <span id="previewCount" class="preview-count"></span>
+          </div>
+          <div id="previewList" class="preview-list"></div>
+        </div>
+
+        <button id="btnRun" class="btn-primary" type="button">
+          <span class="btn-text">
+            <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><polygon points="5 3 19 12 5 21 5 3"/></svg>
+            Run All Scrapers
+          </span>
+          <span class="btn-spinner" hidden>
+            <svg class="spinner" viewBox="0 0 24 24"><circle cx="12" cy="12" r="10" stroke="currentColor" stroke-width="3" fill="none" stroke-dasharray="60" stroke-dashoffset="20"/></svg>
+            Running…
+          </span>
+        </button>
+
+        <div class="divider-or">or</div>
+
+        <button id="btnRunPermanent" class="btn-primary" type="button" style="background:linear-gradient(135deg,#16a34a,#22c55e);box-shadow:0 4px 20px rgba(22,163,74,.4);">
+          <span class="btn-text">
+            <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><path d="M14 2H6a2 2 0 00-2 2v16a2 2 0 002 2h12a2 2 0 002-2V8z"/><polyline points="14 2 14 8 20 8"/></svg>
+            Run from Permanent Google Sheet
+          </span>
+          <span class="btn-spinner" hidden>
+            <svg class="spinner" viewBox="0 0 24 24"><circle cx="12" cy="12" r="10" stroke="currentColor" stroke-width="3" fill="none" stroke-dasharray="60" stroke-dashoffset="20"/></svg>
+            Running…
+          </span>
+        </button>
+        <p class="sheet-hint" style="text-align:center;">Reads from &amp; writes to: <a href="https://docs.google.com/spreadsheets/d/18IbGRZ-aJWI2QVxjHS1zZBo8o-IKrndsi4zu-w7jT4Q" target="_blank" rel="noopener">LinkedIn Scraper Tool</a> — results accumulate weekly.</p>
+      </div>
+    </section>
+
+    <!-- Status -->
+    <div id="statusBar" class="status-bar" hidden>
+      <div class="status-pulse"></div>
+      <span id="statusText"></span>
+    </div>
+
+    <!-- Error -->
+    <div id="errorBox" class="error-box" hidden>
+      <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><circle cx="12" cy="12" r="10"/><line x1="12" y1="8" x2="12" y2="12"/><line x1="12" y1="16" x2="12.01" y2="16"/></svg>
+      <span id="errorMsg"></span>
+    </div>
+
+    <!-- Results -->
+    <section id="results" class="results" hidden>
+      <div class="results-header">
+        <div class="results-title">
+          <h2>Results</h2>
+          <span id="totalCount" class="count-badge"></span>
+        </div>
+        <div class="results-actions">
+          <button id="btnDownloadExcel" class="btn-primary" type="button" style="padding:10px 20px;">
+            <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M21 15v4a2 2 0 01-2 2H5a2 2 0 01-2-2v-4"/><polyline points="7 10 12 15 17 10"/><line x1="12" y1="15" x2="12" y2="3"/></svg>
+            Download Excel
+          </button>
+          <button id="btnExportSheet" class="btn-ghost" type="button">
+            <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M14 2H6a2 2 0 00-2 2v16a2 2 0 002 2h12a2 2 0 002-2V8z"/><polyline points="14 2 14 8 20 8"/><path d="M12 18v-6"/><path d="m9 15 3 3 3-3"/></svg>
+            Export to Google Sheet
+          </button>
+        </div>
+      </div>
+
+      <!-- Result tabs -->
+      <div class="profile-tabs">
+        <button class="tab active" data-result-tab="profiles">Profile Posts <span id="profileResultCount" class="tab-count"></span></button>
+        <button class="tab" data-result-tab="keywords">Keyword Posts <span id="keywordResultCount" class="tab-count"></span></button>
+        <button class="tab" data-result-tab="combo">Profile + Keywords <span id="comboResultCount" class="tab-count"></span></button>
+      </div>
+
+      <div id="postsContainer" class="posts-container"></div>
+    </section>
+
+  </main>
+
+  <footer class="footer">
+    <div class="footer-inner">
+      <div class="footer-logo">
+        <div class="logo-icon" style="width:28px;height:28px;border-radius:7px;">
+          <svg width="16" height="16" viewBox="0 0 24 24" fill="none">
+            <path d="M12 3C7 3 3 7 3 12s4 9 9 9 9-4 9-9" stroke="white" stroke-width="2.2" stroke-linecap="round"/>
+            <path d="M15 8a5 5 0 11-6 7.5" stroke="white" stroke-width="2.2" stroke-linecap="round"/>
+          </svg>
+        </div>
+        amber
+      </div>
+      <p>1 file in → 3 tabs out</p>
+    </div>
+  </footer>
+
+  <!-- Export to Sheet modal -->
+  <div id="exportModal" class="modal-overlay" hidden>
+    <div class="modal">
+      <div class="modal-header">
+        <h3>Export to Google Sheet</h3>
+        <button id="btnCloseModal" class="btn-remove" aria-label="Close">
+          <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/></svg>
+        </button>
+      </div>
+      <div class="modal-body">
+        <div class="form-group">
+          <label>Google Sheet URL</label>
+          <input type="url" id="exportSheetUrl" class="text-input" placeholder="https://docs.google.com/spreadsheets/d/..." />
+        </div>
+        <p class="sheet-hint">Results will be written to 3 tabs: "Profile Posts", "Keyword Posts", "Profile + Keywords"</p>
+        <button id="btnDoExport" class="btn-primary" type="button">
+          <span class="btn-text">Export Now</span>
+          <span class="btn-spinner" hidden>
+            <svg class="spinner" viewBox="0 0 24 24"><circle cx="12" cy="12" r="10" stroke="currentColor" stroke-width="3" fill="none" stroke-dasharray="60" stroke-dashoffset="20"/></svg>
+            Exporting…
+          </span>
+        </button>
+        <div id="exportStatus" class="export-status" hidden></div>
+      </div>
+    </div>
+  </div>
+
+  <script src="/static/js/app.js?v=12"></script>
+</body>
+</html>
