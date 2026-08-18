@@ -101,50 +101,74 @@ def read_sheet_column(sheet_url: str, sheet_name: str = None, col: int = 1) -> l
 
 def export_to_sheet(sheet_url: str, rows: list, sheet_name: str = None):
     """
-    Write rows to a Google Sheet tab.
-    - If the tab already exists, rename it to "TabName - Archive YYYY-MM-DD" first
-    - Then create a fresh tab with the original name and write new data
+    Write rows to a Google Sheet tab with a single rolling archive.
+
+    For each output type there are only ever TWO tabs:
+      - "<name>"            → the latest run (overwritten every time)
+      - "<name> - Archive"  → all previous runs, appended (accumulates)
+
+    On each run, whatever is currently in "<name>" is appended to
+    "<name> - Archive" before "<name>" is overwritten with the new data.
+    Every row carries a scrapeDate column so runs stay distinguishable
+    inside the central archive.
     """
     gc = get_gspread_client()
     spreadsheet = gc.open_by_url(sheet_url)
 
     target_name = sheet_name or "Export"
+    archive_name = f"{target_name} - Archive"
     today = datetime.now().strftime("%Y-%m-%d")
 
-    # If tab exists, archive it
+    # ── Build the fresh data block (header + rows, each tagged scrapeDate) ──
+    if rows:
+        headers = list(rows[0].keys())
+        if "scrapeDate" not in headers:
+            headers.append("scrapeDate")
+        new_data = [headers]
+        for row in rows:
+            row_data = [str(row.get(h, "")) for h in headers[:-1]]
+            row_data.append(today)
+            new_data.append(row_data)
+    else:
+        new_data = [["No data"]]
+
+    # ── 1. Move the current tab's contents into the central archive ────────
     try:
-        existing_ws = spreadsheet.worksheet(target_name)
-        archive_name = f"{target_name} - Archive {today}"
-        # Handle multiple runs on same day
-        existing_titles = [ws.title for ws in spreadsheet.worksheets()]
-        final_archive = archive_name
-        counter = 2
-        while final_archive in existing_titles:
-            final_archive = f"{archive_name} ({counter})"
-            counter += 1
-        existing_ws.update_title(final_archive)
+        current_ws = spreadsheet.worksheet(target_name)
     except Exception:
-        pass  # tab doesn't exist yet, no need to archive
+        current_ws = None
 
-    # Create fresh tab
-    ws = spreadsheet.add_worksheet(title=target_name, rows=max(len(rows) + 1, 100), cols=20)
+    if current_ws is not None:
+        existing = current_ws.get_all_values()
+        # Only archive real data (header + ≥1 row, not the "No data" placeholder)
+        if len(existing) > 1 and existing[0] != ["No data"]:
+            header = existing[0]
+            data_rows = existing[1:]
+            try:
+                archive_ws = spreadsheet.worksheet(archive_name)
+                archive_has_data = len(archive_ws.get_all_values()) > 0
+            except Exception:
+                archive_ws = spreadsheet.add_worksheet(
+                    title=archive_name,
+                    rows=max(len(data_rows) + 10, 100),
+                    cols=max(len(header), 20),
+                )
+                archive_has_data = False
+            if archive_has_data:
+                archive_ws.append_rows(data_rows, value_input_option="RAW")
+            else:
+                archive_ws.append_rows([header] + data_rows, value_input_option="RAW")
 
-    if not rows:
-        ws.update("A1", [["No data"]])
-        return
+    # ── 2. Overwrite the current tab with the fresh run ────────────────────
+    if current_ws is not None:
+        current_ws.clear()
+        ws = current_ws
+    else:
+        ws = spreadsheet.add_worksheet(
+            title=target_name, rows=max(len(new_data) + 10, 100), cols=20
+        )
 
-    headers = list(rows[0].keys())
-    # Add scrapeDate
-    if "scrapeDate" not in headers:
-        headers.append("scrapeDate")
-
-    data = [headers]
-    for row in rows:
-        row_data = [str(row.get(h, "")) for h in headers[:-1]]
-        row_data.append(today)
-        data.append(row_data)
-
-    ws.update("A1", data)
+    ws.update(values=new_data, range_name="A1")
 
 
 # ─── Apify helpers ──────────────────────────────────────────────────────────
