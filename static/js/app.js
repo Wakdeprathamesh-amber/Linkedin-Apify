@@ -82,7 +82,7 @@ async function runAll() {
   fd.append("profilesTab", profilesTab);
   fd.append("keywordsTab", keywordsTab);
   fd.append("maxPosts", maxPosts);
-  fd.append("kwLimit", kwLimit);
+  fd.append("perKeyword", kwLimit);
   fd.append("kwDate", kwDate);
 
   hideError(); setLoading(true); showStatus("Starting…");
@@ -344,7 +344,7 @@ btnRun.addEventListener("click", async () => {
       const resp = await fetch("/api/run-all-json", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ profiles, keywords, maxPosts: parseInt(maxPosts), kwLimit, kwDate }),
+        body: JSON.stringify({ profiles, keywords, maxPosts: parseInt(maxPosts), perKeyword: parseInt(kwLimit), kwDate }),
       });
       if (!resp.ok) throw new Error((await resp.json()).error || "Server error");
 
@@ -423,9 +423,12 @@ function setExportLoading(on) { btnDoExport.disabled = on; btnDoExport.querySele
 /* ─── Run from permanent Google Sheet ───────────────────────────────────── */
 const btnRunPermanent = document.getElementById("btnRunPermanent");
 
+let activeJobId = null;
+let pollTimer = null;
+
 btnRunPermanent.addEventListener("click", async () => {
   const maxPosts = document.getElementById("maxPosts").value;
-  const kwLimit = document.getElementById("kwLimit").value;
+  const perKeyword = document.getElementById("kwLimit").value;
   const kwDate = document.getElementById("kwDate").value;
 
   hideError(); setPermanentLoading(true); showStatus("Reading from Google Sheet…");
@@ -436,28 +439,70 @@ btnRunPermanent.addEventListener("click", async () => {
     const resp = await fetch("/api/run-permanent", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ maxPosts: parseInt(maxPosts), kwLimit, kwDate }),
+      body: JSON.stringify({ maxPosts: parseInt(maxPosts), perKeyword: parseInt(perKeyword), kwDate }),
     });
-    if (!resp.ok) throw new Error((await resp.json()).error || "Server error");
+    const data = await resp.json();
+    if (!resp.ok) throw new Error(data.error || "Server error");
 
-    const reader = resp.body.getReader();
-    const decoder = new TextDecoder();
-    let buffer = "";
-    while (true) {
-      const { done, value } = await reader.read();
-      if (done) break;
-      buffer += decoder.decode(value, { stream: true });
-      const lines = buffer.split("\n\n");
-      buffer = lines.pop();
-      for (const line of lines) {
-        if (!line.startsWith("data:")) continue;
-        const payload = line.slice(5).trim();
-        if (payload) handleMsg(JSON.parse(payload));
-      }
-    }
-  } catch (err) { showError(err.message); }
-  setPermanentLoading(false); hideStatus();
+    activeJobId = data.jobId;
+    showStatus(
+      `Running ${data.keywords} keywords + ${data.profiles} profiles in the background — ` +
+      `about $${data.estimatedCost}. Results are written to the sheet as they finish; ` +
+      `you can close this tab.`
+    );
+    pollJob();
+  } catch (err) {
+    showError(err.message);
+    setPermanentLoading(false); hideStatus();
+  }
 });
+
+/* The sweep runs for ~15 minutes, well past the request timeout, so we poll. */
+async function pollJob() {
+  if (!activeJobId) return;
+  try {
+    const resp = await fetch(`/api/jobs/${activeJobId}`);
+    const job = await resp.json();
+    if (!resp.ok) throw new Error(job.error || "Lost track of the job");
+
+    const pct = job.keywordsTotal
+      ? Math.round((job.keywordsDone / job.keywordsTotal) * 100)
+      : 0;
+    showStatus(
+      `${job.phase} — ${job.keywordsDone}/${job.keywordsTotal} keywords (${pct}%), ` +
+      `${job.postsFound} posts so far`
+    );
+
+    if (job.status === "done" || job.status === "cancelled") {
+      const r = job.result || {};
+      showStatus(
+        `Finished: ${r.profilePosts || 0} profile posts, ${r.keywordPosts || 0} keyword posts, ` +
+        `${r.comboPosts || 0} combo. ${r.keywordsWithResults || 0}/${r.keywordsSearched || 0} ` +
+        `keywords returned results` +
+        (r.keywordsFailed ? `, ${r.keywordsFailed} failed` : "") +
+        `. See the Keyword Report tab in the sheet.`
+      );
+      stopPolling();
+      return;
+    }
+    if (job.status === "error") {
+      showError(job.error || "The run failed.");
+      stopPolling();
+      return;
+    }
+    pollTimer = setTimeout(pollJob, 3000);
+  } catch (err) {
+    showError(err.message);
+    stopPolling();
+  }
+}
+
+function stopPolling() {
+  if (pollTimer) clearTimeout(pollTimer);
+  pollTimer = null;
+  activeJobId = null;
+  setPermanentLoading(false);
+}
 
 function setPermanentLoading(on) {
   btnRunPermanent.disabled = on;

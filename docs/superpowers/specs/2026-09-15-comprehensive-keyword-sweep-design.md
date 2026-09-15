@@ -82,11 +82,14 @@ makes it unmaintainable.
 
 ### Keyword sweep
 
-One actor run **per keyword**, fanned out through a `ThreadPoolExecutor` at **8 concurrent** — well
-under the 32 cap, leaving headroom for the Facebook project sharing the token.
+One actor run **per keyword**, fanned out through a `ThreadPoolExecutor` at **12 concurrent** — under
+the 32 cap, leaving headroom for the Facebook project sharing the token. Measured throughput is
+~12 keywords per 130s, so a 295-keyword sweep takes **about an hour**.
 
-- Each run gets a 180s `run_timeout` so one hung keyword cannot stall the sweep.
-- Results are truncated to 10 per keyword **after** retrieval (the actor always returns a full page).
+- Each run gets a 300s `run_timeout` — the actor's own minimum; it fails fast with
+  "Low timeout! 300 sec is the minimum." below that (caught by the smoke test).
+- Results are truncated to 10 per keyword **after** retrieval. The actor floors `limit` at 20 and
+  returns a full page regardless, so stage-1 cost is the same at any depth (confirmed live).
 - Post URLs are normalised and deduped **across the whole sweep before stage 2**, so the same post is
   never paid for twice. Where several keywords find the same post, the extras are preserved in an
   `alsoMatchedKeywords` column rather than discarded.
@@ -149,6 +152,8 @@ Then one live smoke run on 3 keywords (~$0.13) before any full sweep.
 ## Risks
 
 - A full sweep is a **one-per-month** operation at the current plan and list length.
+- On Render's free plan the browser poll is what keeps the instance awake; closing the tab risks
+  a spin-down killing the run. There is no resume — a killed sweep restarts from scratch.
 - The first sweep adds ~2,400 rows to the sheet.
 - Job state is lost if the Render worker restarts mid-sweep; incremental sheet writes mean completed
   keywords survive, but the run must be restarted.

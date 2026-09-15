@@ -1,6 +1,8 @@
-apify-client>=1.8.1
-flask>=3.1.1
-python-dotenv>=1.1.0
-gspread>=6.0.0
-openpyxl>=3.1.0
-gunicorn>=21.2.0
+# Pinned to major versions. apify-client 1.x -> 3.x changed .call() from a dict
+# to a Run object; an unpinned install silently changed behaviour between deploys.
+apify-client>=3.0.3,<4
+flask>=3.1.1,<4
+python-dotenv>=1.1.0,<2
+gspread>=6.0.0,<7
+openpyxl>=3.1.0,<4
+gunicorn>=21.2.0,<27
