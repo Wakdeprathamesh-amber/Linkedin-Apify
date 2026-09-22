@@ -6,10 +6,8 @@ Flask web app for LinkedIn Post Scraper
 """
 
 import os
-import re
 import json
 import io
-from functools import wraps
 from datetime import datetime
 from flask import (
     Flask, render_template, request, jsonify, Response, send_file,
@@ -19,23 +17,41 @@ from apify_client import ApifyClient
 from dotenv import load_dotenv
 from openpyxl import Workbook, load_workbook
 
+import jobs
+import scrapers
+import sheets
+from scrapers import (
+    PROFILE_ACTOR, clean_keywords, clean_post, compile_keyword_patterns,
+    get_dataset_id, group_posts, match_keywords,
+)
+from sheets import export_to_sheet, read_sheet_column
+
 load_dotenv(override=True)
 
 app = Flask(__name__)
 # Session secret — MUST be set via env in production (Render env var SECRET_KEY)
 app.secret_key = os.environ.get("SECRET_KEY", "dev-insecure-secret-change-me")
 
-PROFILE_ACTOR = "harvestapi/linkedin-profile-posts"
-KEYWORD_ACTOR = "sasky/linkedin-keyword-posts-urls-scraper"
 PERMANENT_SHEET_URL = os.environ.get(
     "PERMANENT_SHEET_URL",
     "https://docs.google.com/spreadsheets/d/18IbGRZ-aJWI2QVxjHS1zZBo8o-IKrndsi4zu-w7jT4Q",
 )
 APIFY_TOKEN = os.environ.get("APIFY_API_TOKEN", "")
 
-# ─── Login credentials (static for now, overridable via env) ─────────────────
+# ─── Login credentials ───────────────────────────────────────────────────────
+# Never hard-code these: this repo is public. Set them as Render dashboard
+# secrets. A deploy without APP_PASSWORD fails fast rather than falling back to
+# a published default.
 APP_USERNAME = os.environ.get("APP_USERNAME", "Amber")
-APP_PASSWORD = os.environ.get("APP_PASSWORD", "Amber@123")
+APP_PASSWORD = os.environ.get("APP_PASSWORD", "")
+
+if not APP_PASSWORD:
+    if os.environ.get("RENDER"):
+        raise RuntimeError(
+            "APP_PASSWORD is not set. Add it as an environment variable in the "
+            "Render dashboard (Settings -> Environment) before deploying."
+        )
+    APP_PASSWORD = "dev-only-password"  # local development only
 
 # ─── Google Sheets credentials ───────────────────────────────────────────────
 # Preferred for cloud/Render: full service-account JSON in env GOOGLE_CREDENTIALS_JSON.
@@ -63,225 +79,173 @@ def require_login():
     return redirect(url_for("login"))
 
 
-# ─── Google Sheets helpers ──────────────────────────────────────────────────
+# ─── Shared helpers ─────────────────────────────────────────────────────────
+# Sheet I/O lives in sheets.py; Apify calls and post cleaning in scrapers.py.
+# Both are unit-tested without Flask (see tests/).
 
-def get_gspread_client():
-    """Return authenticated gspread client using a service account.
+# ─── Keyword sweep ──────────────────────────────────────────────────────────
 
-    Resolution order:
-      1. GOOGLE_CREDENTIALS_JSON env var (raw JSON) — used on Render/cloud.
-      2. credentials.json file on disk — used for local development.
+TAB_PROFILE = "Profile Posts"
+TAB_KEYWORD = "Keyword Posts"
+TAB_COMBO = "Profile + Keywords"
+TAB_REPORT = "Keyword Report"
+
+ARCHIVE_HEADER = [
+    "authorName", "postedAt", "text", "postUrl",
+    "reactions", "comments", "shares", "keyword", "scrapeDate",
+]
+
+
+def make_rows(posts: list) -> list:
+    """Flatten cleaned posts into the sheet's column order."""
+    return [{
+        "authorName": p.get("authorName", ""),
+        "postedAt": p.get("postedAt", ""),
+        "text": (p.get("text", ""))[:5000],
+        "postUrl": p.get("postUrl", ""),
+        "reactions": p.get("reactionsCount", 0),
+        "comments": p.get("commentsCount", 0),
+        "shares": p.get("sharesCount", 0),
+        "keyword": p.get("keyword", ""),
+        "alsoMatchedKeywords": p.get("alsoMatchedKeywords", ""),
+    } for p in posts]
+
+
+def run_sweep(job, token, profiles, keywords, max_posts, per_keyword, kw_date, sheet_url):
+    """Full sweep: profiles, every keyword, combo, then export.
+
+    Runs on a background thread — see jobs.py. Each stage writes to the sheet as
+    soon as it finishes, so a worker restart loses progress but not finished work.
     """
-    import gspread
-    if GOOGLE_CREDENTIALS_JSON.strip():
-        try:
-            info = json.loads(GOOGLE_CREDENTIALS_JSON)
-        except json.JSONDecodeError as e:
-            raise ValueError(
-                "GOOGLE_CREDENTIALS_JSON is set but is not valid JSON: " + str(e)
-            )
-        return gspread.service_account_from_dict(info)
-    if os.path.exists(GSHEET_CREDS):
-        return gspread.service_account(filename=GSHEET_CREDS)
-    raise FileNotFoundError(
-        "Google credentials not found. Set the GOOGLE_CREDENTIALS_JSON env var "
-        f"(full service-account JSON) or provide a file at '{GSHEET_CREDS}'."
-    )
+    client = ApifyClient(token)
+    job.keywords_total = len(keywords)
 
-
-def read_sheet_column(sheet_url: str, sheet_name: str = None, col: int = 1) -> list:
-    """Read all non-empty values from a specific column in a Google Sheet."""
-    gc = get_gspread_client()
-    spreadsheet = gc.open_by_url(sheet_url)
-    ws = spreadsheet.worksheet(sheet_name) if sheet_name else spreadsheet.sheet1
-    values = ws.col_values(col)
-    # Skip header row and filter empty
-    return [v.strip() for v in values[1:] if v.strip()]
-
-
-def export_to_sheet(sheet_url: str, rows: list, sheet_name: str = None):
-    """
-    Write rows to a Google Sheet tab with a single rolling archive.
-
-    For each output type there are only ever TWO tabs:
-      - "<name>"            → the latest run (overwritten every time)
-      - "<name> - Archive"  → all previous runs, appended (accumulates)
-
-    On each run, whatever is currently in "<name>" is appended to
-    "<name> - Archive" before "<name>" is overwritten with the new data.
-    Every row carries a scrapeDate column so runs stay distinguishable
-    inside the central archive.
-    """
-    gc = get_gspread_client()
-    spreadsheet = gc.open_by_url(sheet_url)
-
-    target_name = sheet_name or "Export"
-    archive_name = f"{target_name} - Archive"
-    today = datetime.now().strftime("%Y-%m-%d")
-
-    # ── Build the fresh data block (header + rows, each tagged scrapeDate) ──
-    if rows:
-        headers = list(rows[0].keys())
-        if "scrapeDate" not in headers:
-            headers.append("scrapeDate")
-        new_data = [headers]
-        for row in rows:
-            row_data = [str(row.get(h, "")) for h in headers[:-1]]
-            row_data.append(today)
-            new_data.append(row_data)
-    else:
-        new_data = [["No data"]]
-
-    # ── 1. Move the current tab's contents into the central archive ────────
+    # ── Budget guard ──────────────────────────────────────────────────────
+    estimate = scrapers.estimate_sweep_cost(len(keywords), per_keyword)
+    job.estimated_cost = estimate
     try:
-        current_ws = spreadsheet.worksheet(target_name)
-    except Exception:
-        current_ws = None
+        budget = scrapers.fetch_budget(token)
+        verdict = scrapers.evaluate_budget(estimate, budget["used"], budget["cap"])
+        if not verdict["ok"]:
+            raise RuntimeError(
+                f"Refusing to start: this run needs about ${verdict['estimated']}, "
+                f"but only ${verdict['remaining']} of the ${verdict['cap']} monthly "
+                f"Apify budget is left."
+            )
+        job.log(f"budget ok — est ${estimate}, ${verdict['remaining']} remaining this month")
+    except RuntimeError:
+        raise
+    except Exception as exc:
+        job.log(f"budget check skipped ({exc})")
 
-    if current_ws is not None:
-        existing = current_ws.get_all_values()
-        # Only archive real data (header + ≥1 row, not the "No data" placeholder)
-        if len(existing) > 1 and existing[0] != ["No data"]:
-            header = existing[0]
-            data_rows = existing[1:]
-            try:
-                archive_ws = spreadsheet.worksheet(archive_name)
-                archive_has_data = len(archive_ws.get_all_values()) > 0
-            except Exception:
-                archive_ws = spreadsheet.add_worksheet(
-                    title=archive_name,
-                    rows=max(len(data_rows) + 10, 100),
-                    cols=max(len(header), 20),
-                )
-                archive_has_data = False
-            if archive_has_data:
-                archive_ws.append_rows(data_rows, value_input_option="RAW")
-            else:
-                archive_ws.append_rows([header] + data_rows, value_input_option="RAW")
+    profile_posts_raw, profile_cleaned, keyword_posts, combo_posts = [], [], [], []
 
-    # ── 2. Overwrite the current tab with the fresh run ────────────────────
-    if current_ws is not None:
-        current_ws.clear()
-        ws = current_ws
-    else:
-        ws = spreadsheet.add_worksheet(
-            title=target_name, rows=max(len(new_data) + 10, 100), cols=20
-        )
-
-    ws.update(values=new_data, range_name="A1")
-
-
-# ─── Apify helpers ──────────────────────────────────────────────────────────
-
-def extract_timestamp(post: dict) -> int:
-    raw = post.get("postedAt") or post.get("createdAt") or post.get("publishedAt") or 0
-    if isinstance(raw, dict):
-        return int(raw.get("timestamp") or 0)
-    if isinstance(raw, (int, float)):
-        return int(raw)
-    if isinstance(raw, str) and raw:
+    # ── 1. Profile posts ──────────────────────────────────────────────────
+    if profiles and not job.should_cancel():
+        job.set_phase(f"Scraping {len(profiles)} profiles")
         try:
-            dt = datetime.fromisoformat(raw.replace("Z", "+00:00"))
-            return int(dt.timestamp() * 1000)
-        except Exception:
-            return 0
-    return 0
+            run = client.actor(PROFILE_ACTOR).call(run_input={
+                "targetUrls": profiles, "maxPosts": max_posts,
+                "maxReactions": 0, "postNestedReactions": False,
+                "maxComments": 0, "postNestedComments": False,
+            })
+            if not scrapers.is_successful(
+                run.status if hasattr(run, "status") else (run or {}).get("status", "")
+            ):
+                raise scrapers.ActorError("profile run did not succeed")
+            profile_posts_raw = list(client.dataset(get_dataset_id(run)).iterate_items())
+            profile_cleaned = [clean_post(p) for p in profile_posts_raw]
+            profile_cleaned.sort(key=lambda p: p.get("timestampMs", 0), reverse=True)
+            job.log(f"{len(profile_cleaned)} profile posts")
+        except Exception as exc:
+            job.log(f"profile stage failed: {exc}")
 
+    # ── 2. Keyword sweep — one actor run per keyword ──────────────────────
+    report = []
+    if keywords and not job.should_cancel():
+        job.set_phase(f"Searching {len(keywords)} keywords")
+        raw_rows, report = scrapers.sweep_keywords(
+            client, keywords, kw_date, per_keyword,
+            on_progress=lambda done, total, posts: job.progress(done, total, posts),
+            should_cancel=job.should_cancel,
+        )
+        unique, extras = scrapers.dedupe_keyword_results(raw_rows)
+        job.log(f"{len(raw_rows)} results, {len(unique)} unique after dedupe")
 
-def get_source_url(post: dict) -> str:
-    query = post.get("query") or {}
-    if isinstance(query, dict) and query.get("targetUrl"):
-        return query["targetUrl"].rstrip("/").lower()
-    author = post.get("author") or {}
-    return (
-        author.get("url") or author.get("profileUrl")
-        or post.get("authorUrl") or post.get("profileUrl") or ""
-    ).rstrip("/").lower()
+        # ── 3. Fetch full content for the unique URLs ─────────────────────
+        urls = [r["post_url"] for r in unique if r.get("post_url")]
+        if urls and not job.should_cancel():
+            job.set_phase(f"Fetching content for {len(urls)} posts")
+            content = scrapers.fetch_post_content(
+                client, urls,
+                on_progress=lambda done, total, posts: job.log(
+                    f"content batch {done}/{total} — {posts} posts"
+                ),
+                should_cancel=job.should_cancel,
+            )
+            url_to_kw = {scrapers.normalize_post_url(r.get("post_url", "")): r.get("keyword", "")
+                         for r in unique}
+            for post in content:
+                cleaned = clean_post(post)
+                query = post.get("query") or {}
+                target = query.get("targetUrl", "") if isinstance(query, dict) else ""
+                key = scrapers.normalize_post_url(target) or scrapers.normalize_post_url(
+                    cleaned.get("postUrl", "")
+                )
+                cleaned["keyword"] = url_to_kw.get(key, "")
+                others = [k for k in extras.get(key, []) if k and k != cleaned["keyword"]]
+                cleaned["alsoMatchedKeywords"] = ", ".join(others)
+                keyword_posts.append(cleaned)
+            keyword_posts.sort(key=lambda p: p.get("timestampMs", 0), reverse=True)
+            job.posts_found = len(keyword_posts)
 
+    # ── 4. Combo — profile posts that mention a keyword (whole words only) ─
+    if profile_posts_raw and keywords:
+        job.set_phase("Filtering profile posts by keyword")
+        patterns = compile_keyword_patterns(keywords)
+        for post in profile_posts_raw:
+            text = post.get("content") or post.get("text") or post.get("description") or ""
+            matched = match_keywords(text, patterns)
+            if matched:
+                cleaned = clean_post(post)
+                cleaned["keyword"] = ", ".join(matched)
+                combo_posts.append(cleaned)
+        combo_posts.sort(key=lambda p: p.get("timestampMs", 0), reverse=True)
+        job.log(f"{len(combo_posts)} combo matches")
 
-def clean_post(post: dict) -> dict:
-    author = post.get("author") or {}
+    # ── 5. Export ─────────────────────────────────────────────────────────
+    if sheet_url:
+        job.set_phase("Saving to Google Sheet")
+        today = datetime.now().strftime("%Y-%m-%d")
+        for tab, posts in (
+            (TAB_PROFILE, profile_cleaned),
+            (TAB_KEYWORD, keyword_posts),
+            (TAB_COMBO, combo_posts),
+        ):
+            if not posts:
+                continue
+            try:
+                export_to_sheet(sheet_url, make_rows(posts), tab)
+                job.log(f"wrote {len(posts)} rows to '{tab}'")
+            except Exception as exc:
+                job.log(f"could not write '{tab}': {exc}")
+        if report:
+            try:
+                sheets.write_tab(sheet_url, sheets.build_keyword_report(report, today), TAB_REPORT)
+                duds = sum(1 for r in report if not r.get("found"))
+                job.log(f"keyword report written — {duds} of {len(report)} returned nothing")
+            except Exception as exc:
+                job.log(f"could not write '{TAB_REPORT}': {exc}")
 
-    posted_at_raw = post.get("postedAt") or post.get("createdAt") or post.get("publishedAt") or {}
-    timestamp_ms = extract_timestamp(post)
-
-    if isinstance(posted_at_raw, dict):
-        posted_at_str = posted_at_raw.get("date") or posted_at_raw.get("postedAgoText") or ""
-    elif isinstance(posted_at_raw, str):
-        posted_at_str = posted_at_raw
-    else:
-        posted_at_str = ""
-
-    return {
-        "authorName": author.get("name") or post.get("authorName") or "Unknown",
-        "authorUrl": (
-            author.get("url") or author.get("profileUrl")
-            or post.get("authorUrl") or post.get("profileUrl") or ""
-        ),
-        "authorImage": (
-            author.get("image") or author.get("profilePicture")
-            or author.get("avatar") or post.get("authorImage") or ""
-        ),
-        "postUrl": (
-            post.get("linkedinUrl")
-            or post.get("shareLinkedinUrl")
-            or post.get("url")
-            or post.get("postUrl")
-            or post.get("link")
-            or ""
-        ),
-        "postedAt": posted_at_str,
-        "timestampMs": timestamp_ms,
-        "text": (
-            post.get("content")
-            or post.get("text")
-            or post.get("description")
-            or ""
-        ),
-        "reactionsCount": int(
-            (post.get("engagement") or {}).get("likes")
-            or post.get("reactionsCount")
-            or post.get("likesCount")
-            or post.get("reactions")
-            or 0
-        ),
-        "commentsCount": int(
-            (post.get("engagement") or {}).get("comments")
-            or post.get("commentsCount")
-            or post.get("comments")
-            or 0
-        ),
-        "sharesCount": int(
-            (post.get("engagement") or {}).get("shares")
-            or post.get("sharesCount")
-            or post.get("shares")
-            or 0
-        ),
-        "images": post.get("images") or post.get("media") or [],
+    job.result = {
+        "profilePosts": len(profile_cleaned),
+        "keywordPosts": len(keyword_posts),
+        "comboPosts": len(combo_posts),
+        "keywordsSearched": len(report),
+        "keywordsWithResults": sum(1 for r in report if r.get("found")),
+        "keywordsFailed": sum(1 for r in report if r.get("status") == "failed"),
+        "estimatedCost": job.estimated_cost,
     }
-
-
-def group_posts(posts: list, profile_urls: list) -> dict:
-    grouped = {url: [] for url in profile_urls}
-    for post in posts:
-        source = get_source_url(post)
-        cleaned = clean_post(post)
-        matched = False
-        for url in profile_urls:
-            norm = url.rstrip("/").lower()
-            if source and (source == norm or source.startswith(norm) or norm.startswith(source)):
-                grouped[url].append(cleaned)
-                matched = True
-                break
-        if not matched and profile_urls:
-            grouped[profile_urls[0]].append(cleaned)
-    for url in profile_urls:
-        grouped[url].sort(key=lambda p: p["timestampMs"], reverse=True)
-    return grouped
-
-
-def get_dataset_id(run) -> str:
-    return run.default_dataset_id if hasattr(run, "default_dataset_id") else run["defaultDatasetId"]
 
 
 # ─── Routes ─────────────────────────────────────────────────────────────────
@@ -317,6 +281,93 @@ def health():
 @app.route("/")
 def index():
     return render_template("index.html", user=session.get("user", ""))
+
+
+@app.route("/api/budget", methods=["GET"])
+def budget():
+    """Remaining Apify allowance, and what a full sweep would cost."""
+    if not APIFY_TOKEN:
+        return jsonify({"error": "Apify API token not configured."}), 500
+    try:
+        current = scrapers.fetch_budget(APIFY_TOKEN)
+        keywords = clean_keywords(read_sheet_column(PERMANENT_SHEET_URL, "Keywords"))
+        per_keyword = int(request.args.get("perKeyword", 10))
+        estimate = scrapers.estimate_sweep_cost(len(keywords), per_keyword)
+        verdict = scrapers.evaluate_budget(estimate, current["used"], current["cap"])
+        verdict["keywords"] = len(keywords)
+        return jsonify(verdict)
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+
+@app.route("/api/sweep", methods=["POST"])
+def start_sweep():
+    """Kick off a full sweep in the background and return its job id.
+
+    A 295-keyword sweep runs for ~15 minutes, well past the 600s request
+    timeout, so the work detaches and the browser polls /api/jobs/<id>.
+    """
+    if not APIFY_TOKEN:
+        return jsonify({"error": "Apify API token not configured."}), 500
+
+    data = request.get_json(silent=True) or {}
+    sheet_url = data.get("sheetUrl") or PERMANENT_SHEET_URL
+    max_posts = int(data.get("maxPosts", 5))
+    per_keyword = max(1, int(data.get("perKeyword", 10)))
+    kw_date = data.get("kwDate", "last-1-week")
+
+    profiles = data.get("profiles")
+    keywords = data.get("keywords")
+    if profiles is None or keywords is None:
+        try:
+            profiles = read_sheet_column(sheet_url, "Profiles")
+            keywords = read_sheet_column(sheet_url, "Keywords")
+        except Exception as e:
+            return jsonify({"error": f"Failed to read sheet: {str(e)}"}), 500
+
+    profiles = [p.strip() for p in (profiles or []) if p.strip()]
+    keywords = clean_keywords(keywords or [])
+    if not profiles and not keywords:
+        return jsonify({"error": "No profiles or keywords found."}), 400
+
+    job = jobs.create("sweep")
+    jobs.start(job, run_sweep, APIFY_TOKEN, profiles, keywords,
+               max_posts, per_keyword, kw_date, sheet_url)
+    return jsonify({
+        "jobId": job.id,
+        "keywords": len(keywords),
+        "profiles": len(profiles),
+        "estimatedCost": scrapers.estimate_sweep_cost(len(keywords), per_keyword),
+    })
+
+
+@app.route("/api/jobs/<job_id>", methods=["GET"])
+def job_status(job_id):
+    job = jobs.get(job_id)
+    if not job:
+        return jsonify({"error": "Unknown job. It may have expired or the server restarted."}), 404
+    return jsonify(job.to_dict())
+
+
+@app.route("/api/jobs/<job_id>/cancel", methods=["POST"])
+def job_cancel(job_id):
+    if not jobs.cancel(job_id):
+        return jsonify({"error": "Job not found or already finished."}), 404
+    return jsonify({"success": True})
+
+
+@app.route("/api/repair-archives", methods=["POST"])
+def repair_archives():
+    """One-off: put the header row back on archive tabs written without one."""
+    data = request.get_json(silent=True) or {}
+    sheet_url = data.get("sheetUrl") or PERMANENT_SHEET_URL
+    tabs = data.get("tabs") or [
+        f"{TAB_KEYWORD} - Archive", f"{TAB_COMBO} - Archive", f"{TAB_PROFILE} - Archive",
+    ]
+    try:
+        return jsonify({"results": sheets.repair_archive_headers(sheet_url, ARCHIVE_HEADER, tabs)})
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
 
 
 @app.route("/api/scrape", methods=["POST"])
@@ -366,100 +417,79 @@ def scrape():
 
     return Response(stream(), mimetype="text/event-stream")
 
-
 @app.route("/api/keyword-scrape", methods=["POST"])
 def keyword_scrape():
     """
     POST /api/keyword-scrape
-    Body: { "keywords": ["keyword1", ...], "limit": "20", "date": "last-1-week" }
-    Returns SSE with post URLs grouped by keyword.
+    Body: { "keywords": ["keyword1", ...], "perKeyword": 10, "date": "last-1-week" }
+    Returns SSE with the posts found for every keyword.
+
+    One actor run per keyword. The actor's `limit` is a global cap and it works
+    through keywords in order, so a single call with many keywords only ever
+    searches the first one.
     """
     data = request.get_json(force=True)
-    keywords = [k.strip() for k in data.get("keywords", []) if k.strip()]
-    limit = str(data.get("limit", "20"))
-    date_filter = data.get("date", "ignore")
+    keywords = clean_keywords(data.get("keywords", []))
+    per_keyword = max(1, int(data.get("perKeyword", data.get("limit", 10)) or 10))
+    date_filter = data.get("date", "last-1-week")
     token = APIFY_TOKEN or data.get("token", "")
 
     if not keywords:
         return jsonify({"error": "Please provide at least one keyword."}), 400
     if not token:
         return jsonify({"error": "Apify API token is not configured."}), 500
-
-    # Clean keywords — strip bullet prefixes like "- ", "• ", "* "
-    import re
-    keywords = [re.sub(r'^[\-\•\*]\s*', '', k).strip() for k in keywords]
-    # Remove special characters that LinkedIn search doesn't support
-    keywords = [re.sub(r'[&\+\#\@\!\?\*]', ' ', k).strip() for k in keywords]
-    # Collapse multiple spaces
-    keywords = [re.sub(r'\s+', ' ', k) for k in keywords]
-    # Remove section headers (entries ending with ":" like "Australia:", "Other Regions:")
-    keywords = [k for k in keywords if not k.endswith(':')]
-    # Remove entries that are too short (less than 3 chars) or empty
-    keywords = [k for k in keywords if len(k) >= 3]
+    if len(keywords) > 30:
+        return jsonify({
+            "error": f"{len(keywords)} keywords is too many for a live run "
+                     f"(each is a separate actor call). Use the one-click sweep instead — "
+                     f"it runs in the background and reports progress.",
+        }), 400
 
     def stream():
         try:
             client = ApifyClient(token)
-            run_input = {
-                "keywords": keywords,
-                "limit": limit,
-                "date": date_filter,
-            }
-            yield "data: " + json.dumps({"status": "running", "step": "Finding post URLs..."}) + "\n\n"
+            yield "data: " + json.dumps({
+                "status": "running",
+                "step": f"Searching {len(keywords)} keywords…",
+                "estimatedCost": scrapers.estimate_sweep_cost(len(keywords), per_keyword),
+            }) + "\n\n"
 
-            run = client.actor(KEYWORD_ACTOR).call(run_input=run_input)
+            raw_rows, report = scrapers.sweep_keywords(
+                client, keywords, date_filter, per_keyword
+            )
+            unique, extras = scrapers.dedupe_keyword_results(raw_rows)
 
-            # Check if run succeeded
-            run_status = run.status if hasattr(run, "status") else run.get("status", "")
-            if run_status == "FAILED":
-                msg = run.status_message if hasattr(run, "status_message") else "Actor run failed."
-                yield "data: " + json.dumps({"status": "error", "message": str(msg)}) + "\n\n"
-                return
-
-            results = list(client.dataset(get_dataset_id(run)).iterate_items())
-
-            if not results:
-                yield "data: " + json.dumps({"status": "results", "keywords": keywords, "posts": [], "total": 0}) + "\n\n"
+            if not unique:
+                yield "data: " + json.dumps({
+                    "status": "results", "keywords": keywords, "posts": [], "total": 0,
+                    "report": report,
+                }) + "\n\n"
                 yield "data: " + json.dumps({"status": "done", "total": 0}) + "\n\n"
                 return
 
-            # Step 2: Fetch actual post content using the profile posts scraper
-            post_urls = [r.get("post_url") for r in results if r.get("post_url")]
-            if not post_urls:
-                yield "data: " + json.dumps({"status": "results", "keywords": keywords, "posts": results, "total": len(results)}) + "\n\n"
-                yield "data: " + json.dumps({"status": "done", "total": len(results)}) + "\n\n"
-                return
+            urls = [r["post_url"] for r in unique if r.get("post_url")]
+            yield "data: " + json.dumps({
+                "status": "running",
+                "step": f"Found {len(urls)} unique posts. Fetching content…",
+            }) + "\n\n"
 
-            yield "data: " + json.dumps({"status": "running", "step": f"Found {len(post_urls)} posts. Fetching content..."}) + "\n\n"
+            content = scrapers.fetch_post_content(client, urls)
+            url_to_kw = {scrapers.normalize_post_url(r.get("post_url", "")): r.get("keyword", "")
+                         for r in unique}
 
-            # Use the profile posts scraper to get full content from URLs
-            content_run = client.actor(PROFILE_ACTOR).call(run_input={
-                "targetUrls": post_urls,
-                "maxPosts": 1,
-                "maxReactions": 0,
-                "postNestedReactions": False,
-                "maxComments": 0,
-                "postNestedComments": False,
-            })
-
-            content_posts = list(client.dataset(get_dataset_id(content_run)).iterate_items())
-
-            # Clean and enrich with keyword info
             enriched = []
-            # Build a lookup from URL results to keyword
-            url_to_keyword = {r.get("post_url", ""): r.get("keyword", "") for r in results}
-
-            for post in content_posts:
+            for post in content:
                 cleaned = clean_post(post)
-                # Try to match back to keyword
-                post_url = post.get("url") or post.get("postUrl") or post.get("link") or ""
                 query = post.get("query") or {}
-                target_url = query.get("targetUrl", "") if isinstance(query, dict) else ""
-                matched_keyword = url_to_keyword.get(target_url, "")
-                cleaned["keyword"] = matched_keyword
+                target = query.get("targetUrl", "") if isinstance(query, dict) else ""
+                key = scrapers.normalize_post_url(target) or scrapers.normalize_post_url(
+                    cleaned.get("postUrl", "")
+                )
+                cleaned["keyword"] = url_to_kw.get(key, "")
+                others = [k for k in extras.get(key, []) if k and k != cleaned["keyword"]]
+                cleaned["alsoMatchedKeywords"] = ", ".join(others)
                 enriched.append(cleaned)
 
-            # Sort by timestamp
             enriched.sort(key=lambda p: p.get("timestampMs", 0), reverse=True)
 
             yield "data: " + json.dumps({
@@ -467,8 +497,8 @@ def keyword_scrape():
                 "keywords": keywords,
                 "posts": enriched,
                 "total": len(enriched),
+                "report": report,
             }) + "\n\n"
-
             yield "data: " + json.dumps({"status": "done", "total": len(enriched)}) + "\n\n"
         except Exception as e:
             yield "data: " + json.dumps({"status": "error", "message": str(e)}) + "\n\n"
@@ -622,145 +652,38 @@ def download_excel():
 
 @app.route("/api/run-permanent", methods=["POST"])
 def run_permanent():
+    """One-click run over the permanent sheet.
+
+    Delegates to the background sweep: 295 keywords is ~15 minutes of work, far
+    past the 600s request timeout, so this returns a job id and the page polls
+    /api/jobs/<id>. Results are written to the sheet as each stage finishes.
     """
-    One-click run: reads from permanent sheet (Profiles + Keywords tabs),
-    runs all scrapers, appends results to 3 output tabs in the same sheet.
-    """
-    token = APIFY_TOKEN
-    if not token:
+    if not APIFY_TOKEN:
         return jsonify({"error": "Apify API token not configured."}), 500
 
-    # Read input from permanent sheet
+    data = request.get_json(silent=True) or {}
+    max_posts = int(data.get("maxPosts", 5))
+    per_keyword = max(1, int(data.get("perKeyword", data.get("kwLimit", 10)) or 10))
+    kw_date = data.get("kwDate", "last-1-week")
+
     try:
-        gc = get_gspread_client()
-        spreadsheet = gc.open_by_url(PERMANENT_SHEET_URL)
-
-        profiles = []
-        try:
-            ws = spreadsheet.worksheet("Profiles")
-            vals = ws.col_values(1)
-            profiles = [v.strip() for v in vals[1:] if v.strip()]
-        except Exception:
-            pass
-
-        keywords_raw = []
-        try:
-            ws = spreadsheet.worksheet("Keywords")
-            vals = ws.col_values(1)
-            keywords_raw = [v.strip() for v in vals[1:] if v.strip()]
-        except Exception:
-            pass
+        profiles = read_sheet_column(PERMANENT_SHEET_URL, "Profiles")
+        keywords = clean_keywords(read_sheet_column(PERMANENT_SHEET_URL, "Keywords"))
     except Exception as e:
         return jsonify({"error": f"Failed to read sheet: {str(e)}"}), 500
 
-    if not profiles and not keywords_raw:
+    if not profiles and not keywords:
         return jsonify({"error": "No profiles or keywords found in sheet."}), 400
 
-    # Clean keywords
-    import re
-    keywords = [re.sub(r'^[\-\•\*]\s*', '', k).strip() for k in keywords_raw]
-    keywords = [re.sub(r'[&\+\#\@\!\?\*]', ' ', k).strip() for k in keywords]
-    keywords = [re.sub(r'\s+', ' ', k) for k in keywords]
-    keywords = [k for k in keywords if not k.endswith(':')]
-    keywords = [k for k in keywords if len(k) >= 3]
-
-    max_posts = int(request.json.get("maxPosts", 5)) if request.is_json else 5
-    kw_limit = request.json.get("kwLimit", "20") if request.is_json else "20"
-    kw_date = request.json.get("kwDate", "last-1-week") if request.is_json else "last-1-week"
-
-    def stream():
-        client = ApifyClient(token)
-        profile_posts_raw = []
-        profile_cleaned = []
-        keyword_posts = []
-        combo_posts = []
-
-        # ── 1. Profile Posts ──
-        if profiles:
-            try:
-                yield "data: " + json.dumps({"status": "running", "step": f"Scraping {len(profiles)} profiles…"}) + "\n\n"
-                run = client.actor(PROFILE_ACTOR).call(run_input={
-                    "targetUrls": profiles, "maxPosts": max_posts,
-                    "maxReactions": 0, "postNestedReactions": False, "maxComments": 0, "postNestedComments": False,
-                })
-                profile_posts_raw = list(client.dataset(get_dataset_id(run)).iterate_items())
-                profile_cleaned = [clean_post(p) for p in profile_posts_raw]
-                profile_cleaned.sort(key=lambda p: p["timestampMs"], reverse=True)
-                yield "data: " + json.dumps({"status": "profileResults", "posts": profile_cleaned, "total": len(profile_cleaned)}) + "\n\n"
-            except Exception as e:
-                yield "data: " + json.dumps({"status": "profileResults", "posts": [], "total": 0, "error": str(e)}) + "\n\n"
-
-        # ── 2. Keyword Posts ──
-        if keywords:
-            try:
-                yield "data: " + json.dumps({"status": "running", "step": f"Searching {len(keywords)} keywords…"}) + "\n\n"
-                run = client.actor(KEYWORD_ACTOR).call(run_input={"keywords": keywords, "limit": kw_limit, "date": kw_date})
-                run_status = run.status if hasattr(run, "status") else ""
-                if run_status == "FAILED":
-                    yield "data: " + json.dumps({"status": "keywordResults", "posts": [], "total": 0, "error": "Keyword actor failed"}) + "\n\n"
-                else:
-                    kw_results = list(client.dataset(get_dataset_id(run)).iterate_items())
-                    post_urls = [r.get("post_url") for r in kw_results if r.get("post_url")]
-                    if post_urls:
-                        yield "data: " + json.dumps({"status": "running", "step": f"Fetching content for {len(post_urls)} keyword posts…"}) + "\n\n"
-                        content_run = client.actor(PROFILE_ACTOR).call(run_input={
-                            "targetUrls": post_urls, "maxPosts": 1,
-                            "maxReactions": 0, "postNestedReactions": False, "maxComments": 0, "postNestedComments": False,
-                        })
-                        content_posts = list(client.dataset(get_dataset_id(content_run)).iterate_items())
-                        url_to_kw = {r.get("post_url", ""): r.get("keyword", "") for r in kw_results}
-                        for p in content_posts:
-                            cleaned = clean_post(p)
-                            query = p.get("query") or {}
-                            target = query.get("targetUrl", "") if isinstance(query, dict) else ""
-                            cleaned["keyword"] = url_to_kw.get(target, "")
-                            keyword_posts.append(cleaned)
-                        keyword_posts.sort(key=lambda p: p["timestampMs"], reverse=True)
-                    yield "data: " + json.dumps({"status": "keywordResults", "posts": keyword_posts, "total": len(keyword_posts)}) + "\n\n"
-            except Exception as e:
-                yield "data: " + json.dumps({"status": "keywordResults", "posts": [], "total": 0, "error": str(e)}) + "\n\n"
-
-        # ── 3. Combo ──
-        if profiles and keywords:
-            yield "data: " + json.dumps({"status": "running", "step": "Filtering profile posts by keywords…"}) + "\n\n"
-            keyword_lower = [k.lower() for k in keywords]
-            for p in profile_posts_raw:
-                text = (p.get("content") or p.get("text") or p.get("description") or "").lower()
-                matched = [k for k in keyword_lower if k in text]
-                if matched:
-                    cleaned = clean_post(p)
-                    cleaned["keyword"] = ", ".join(matched)
-                    combo_posts.append(cleaned)
-            combo_posts.sort(key=lambda p: p["timestampMs"], reverse=True)
-            yield "data: " + json.dumps({"status": "comboResults", "posts": combo_posts, "total": len(combo_posts)}) + "\n\n"
-
-        # ── 4. Export to permanent sheet (only Keywords and Combo, fresh tabs) ──
-        yield "data: " + json.dumps({"status": "running", "step": "Saving results to Google Sheet…"}) + "\n\n"
-        try:
-            def make_rows(posts):
-                return [{"authorName": p.get("authorName",""), "postedAt": p.get("postedAt",""),
-                         "text": (p.get("text",""))[:5000], "postUrl": p.get("postUrl",""),
-                         "reactions": p.get("reactionsCount",0), "comments": p.get("commentsCount",0),
-                         "shares": p.get("sharesCount",0), "keyword": p.get("keyword","")} for p in posts]
-
-            new_kw = 0
-            new_combo = 0
-
-            if keyword_posts:
-                export_to_sheet(PERMANENT_SHEET_URL, make_rows(keyword_posts), "Keyword Posts")
-                new_kw = len(keyword_posts)
-
-            if combo_posts:
-                export_to_sheet(PERMANENT_SHEET_URL, make_rows(combo_posts), "Profile + Keywords")
-                new_combo = len(combo_posts)
-
-            yield "data: " + json.dumps({"status": "running", "step": f"✅ Saved {new_kw} keyword posts, {new_combo} combo posts to sheet."}) + "\n\n"
-        except Exception as e:
-            yield "data: " + json.dumps({"status": "running", "step": f"⚠️ Sheet export failed: {str(e)}"}) + "\n\n"
-
-        yield "data: " + json.dumps({"status": "done"}) + "\n\n"
-
-    return Response(stream(), mimetype="text/event-stream")
+    job = jobs.create("run-permanent")
+    jobs.start(job, run_sweep, APIFY_TOKEN, profiles, keywords,
+               max_posts, per_keyword, kw_date, PERMANENT_SHEET_URL)
+    return jsonify({
+        "jobId": job.id,
+        "profiles": len(profiles),
+        "keywords": len(keywords),
+        "estimatedCost": scrapers.estimate_sweep_cost(len(keywords), per_keyword),
+    })
 
 
 @app.route("/api/run-all-json", methods=["POST"])
@@ -774,7 +697,7 @@ def run_all_json():
     profiles = [u.strip() for u in data.get("profiles", []) if u.strip()]
     keywords_raw = [k.strip() for k in data.get("keywords", []) if k.strip()]
     max_posts = int(data.get("maxPosts", 5))
-    kw_limit = str(data.get("kwLimit", "20"))
+    per_keyword = max(1, int(data.get("perKeyword", data.get("kwLimit", 10)) or 10))
     kw_date = data.get("kwDate", "last-1-week")
     token = APIFY_TOKEN
 
@@ -783,13 +706,7 @@ def run_all_json():
     if not profiles and not keywords_raw:
         return jsonify({"error": "No profiles or keywords provided."}), 400
 
-    # Clean keywords
-    import re
-    keywords = [re.sub(r'^[\-\•\*]\s*', '', k).strip() for k in keywords_raw]
-    keywords = [re.sub(r'[&\+\#\@\!\?\*]', ' ', k).strip() for k in keywords]
-    keywords = [re.sub(r'\s+', ' ', k) for k in keywords]
-    keywords = [k for k in keywords if not k.endswith(':')]
-    keywords = [k for k in keywords if len(k) >= 3]
+    keywords = clean_keywords(keywords_raw)
 
     def stream():
         client = ApifyClient(token)
@@ -806,7 +723,7 @@ def run_all_json():
                 })
                 profile_posts_raw = list(client.dataset(get_dataset_id(run)).iterate_items())
                 profile_cleaned = [clean_post(p) for p in profile_posts_raw]
-                profile_cleaned.sort(key=lambda p: p["timestampMs"], reverse=True)
+                profile_cleaned.sort(key=lambda p: p.get("timestampMs", 0), reverse=True)
                 yield "data: " + json.dumps({"status": "profileResults", "posts": profile_cleaned, "total": len(profile_cleaned)}) + "\n\n"
             except Exception as e:
                 yield "data: " + json.dumps({"status": "profileResults", "posts": [], "total": 0, "error": str(e)}) + "\n\n"
@@ -814,43 +731,43 @@ def run_all_json():
         if keywords:
             try:
                 yield "data: " + json.dumps({"status": "running", "step": f"Searching {len(keywords)} keywords…"}) + "\n\n"
-                run = client.actor(KEYWORD_ACTOR).call(run_input={"keywords": keywords, "limit": kw_limit, "date": kw_date})
-                run_status = run.status if hasattr(run, "status") else ""
-                if run_status == "FAILED":
-                    yield "data: " + json.dumps({"status": "keywordResults", "posts": [], "total": 0, "error": "Keyword actor failed"}) + "\n\n"
-                else:
-                    kw_results = list(client.dataset(get_dataset_id(run)).iterate_items())
-                    post_urls = [r.get("post_url") for r in kw_results if r.get("post_url")]
-                    if post_urls:
-                        yield "data: " + json.dumps({"status": "running", "step": f"Fetching content for {len(post_urls)} keyword posts…"}) + "\n\n"
-                        content_run = client.actor(PROFILE_ACTOR).call(run_input={
-                            "targetUrls": post_urls, "maxPosts": 1,
-                            "maxReactions": 0, "postNestedReactions": False, "maxComments": 0, "postNestedComments": False,
-                        })
-                        content_posts = list(client.dataset(get_dataset_id(content_run)).iterate_items())
-                        url_to_kw = {r.get("post_url", ""): r.get("keyword", "") for r in kw_results}
-                        for p in content_posts:
-                            cleaned = clean_post(p)
-                            query = p.get("query") or {}
-                            target = query.get("targetUrl", "") if isinstance(query, dict) else ""
-                            cleaned["keyword"] = url_to_kw.get(target, "")
-                            keyword_posts.append(cleaned)
-                        keyword_posts.sort(key=lambda p: p["timestampMs"], reverse=True)
-                    yield "data: " + json.dumps({"status": "keywordResults", "posts": keyword_posts, "total": len(keyword_posts)}) + "\n\n"
+                # One actor run per keyword — a single call with the whole list
+                # only ever searches the first keyword.
+                raw_rows, kw_report = scrapers.sweep_keywords(
+                    client, keywords, kw_date, per_keyword
+                )
+                unique, extras = scrapers.dedupe_keyword_results(raw_rows)
+                post_urls = [r["post_url"] for r in unique if r.get("post_url")]
+                if post_urls:
+                    yield "data: " + json.dumps({"status": "running", "step": f"Fetching content for {len(post_urls)} unique keyword posts…"}) + "\n\n"
+                    content_posts = scrapers.fetch_post_content(client, post_urls)
+                    url_to_kw = {scrapers.normalize_post_url(r.get("post_url", "")): r.get("keyword", "")
+                                 for r in unique}
+                    for p in content_posts:
+                        cleaned = clean_post(p)
+                        query = p.get("query") or {}
+                        target = query.get("targetUrl", "") if isinstance(query, dict) else ""
+                        key = scrapers.normalize_post_url(target) or scrapers.normalize_post_url(cleaned.get("postUrl", ""))
+                        cleaned["keyword"] = url_to_kw.get(key, "")
+                        others = [k for k in extras.get(key, []) if k and k != cleaned["keyword"]]
+                        cleaned["alsoMatchedKeywords"] = ", ".join(others)
+                        keyword_posts.append(cleaned)
+                    keyword_posts.sort(key=lambda p: p.get("timestampMs", 0), reverse=True)
+                yield "data: " + json.dumps({"status": "keywordResults", "posts": keyword_posts, "total": len(keyword_posts), "report": kw_report}) + "\n\n"
             except Exception as e:
                 yield "data: " + json.dumps({"status": "keywordResults", "posts": [], "total": 0, "error": str(e)}) + "\n\n"
 
         if profiles and keywords:
             yield "data: " + json.dumps({"status": "running", "step": "Filtering profile posts by keywords…"}) + "\n\n"
-            keyword_lower = [k.lower() for k in keywords]
+            patterns = compile_keyword_patterns(keywords)
             for p in profile_posts_raw:
-                text = (p.get("content") or p.get("text") or p.get("description") or "").lower()
-                matched = [k for k in keyword_lower if k in text]
+                text = p.get("content") or p.get("text") or p.get("description") or ""
+                matched = match_keywords(text, patterns)
                 if matched:
                     cleaned = clean_post(p)
                     cleaned["keyword"] = ", ".join(matched)
                     combo_posts.append(cleaned)
-            combo_posts.sort(key=lambda p: p["timestampMs"], reverse=True)
+            combo_posts.sort(key=lambda p: p.get("timestampMs", 0), reverse=True)
             yield "data: " + json.dumps({"status": "comboResults", "posts": combo_posts, "total": len(combo_posts)}) + "\n\n"
 
         yield "data: " + json.dumps({"status": "done"}) + "\n\n"
@@ -872,7 +789,7 @@ def run_all():
     profiles_tab = request.form.get("profilesTab", "profiles").strip()
     keywords_tab = request.form.get("keywordsTab", "keywords").strip()
     max_posts = int(request.form.get("maxPosts", 5))
-    kw_limit = request.form.get("kwLimit", "20")
+    per_keyword = max(1, int(request.form.get("perKeyword", request.form.get("kwLimit", 10)) or 10))
     kw_date = request.form.get("kwDate", "last-1-week")
     token = APIFY_TOKEN
 
@@ -906,13 +823,7 @@ def run_all():
     if not profiles and not keywords_raw:
         return jsonify({"error": f"No data found. Check tab names ('{profiles_tab}', '{keywords_tab}')."}), 400
 
-    # Clean keywords
-    import re
-    keywords = [re.sub(r'^[\-\•\*]\s*', '', k).strip() for k in keywords_raw]
-    keywords = [re.sub(r'[&\+\#\@\!\?\*]', ' ', k).strip() for k in keywords]
-    keywords = [re.sub(r'\s+', ' ', k) for k in keywords]
-    keywords = [k for k in keywords if not k.endswith(':')]
-    keywords = [k for k in keywords if len(k) >= 3]
+    keywords = clean_keywords(keywords_raw)
 
     def stream():
         client = ApifyClient(token)
@@ -934,7 +845,7 @@ def run_all():
                 })
                 profile_posts_raw = list(client.dataset(get_dataset_id(run)).iterate_items())
                 profile_cleaned = [clean_post(p) for p in profile_posts_raw]
-                profile_cleaned.sort(key=lambda p: p["timestampMs"], reverse=True)
+                profile_cleaned.sort(key=lambda p: p.get("timestampMs", 0), reverse=True)
                 yield "data: " + json.dumps({
                     "status": "profileResults",
                     "posts": profile_cleaned,
@@ -947,66 +858,51 @@ def run_all():
         if keywords:
             try:
                 yield "data: " + json.dumps({"status": "running", "step": f"Searching {len(keywords)} keywords…"}) + "\n\n"
-                run = client.actor(KEYWORD_ACTOR).call(run_input={
-                    "keywords": keywords,
-                    "limit": kw_limit,
-                    "date": kw_date,
-                })
-                run_status = run.status if hasattr(run, "status") else ""
-                if run_status == "FAILED":
-                    yield "data: " + json.dumps({"status": "keywordResults", "posts": [], "total": 0, "error": "Keyword actor failed"}) + "\n\n"
-                else:
-                    kw_results = list(client.dataset(get_dataset_id(run)).iterate_items())
-                    # Fetch content for keyword post URLs
-                    post_urls = [r.get("post_url") for r in kw_results if r.get("post_url")]
-                    if post_urls:
-                        yield "data: " + json.dumps({"status": "running", "step": f"Fetching content for {len(post_urls)} keyword posts…"}) + "\n\n"
-                        content_run = client.actor(PROFILE_ACTOR).call(run_input={
-                            "targetUrls": post_urls,
-                            "maxPosts": 1,
-                            "maxReactions": 0,
-                            "postNestedReactions": False,
-                            "maxComments": 0,
-                            "postNestedComments": False,
-                        })
-                        content_posts = list(client.dataset(get_dataset_id(content_run)).iterate_items())
-                        url_to_kw = {r.get("post_url", ""): r.get("keyword", "") for r in kw_results}
-                        for p in content_posts:
-                            cleaned = clean_post(p)
-                            query = p.get("query") or {}
-                            target = query.get("targetUrl", "") if isinstance(query, dict) else ""
-                            cleaned["keyword"] = url_to_kw.get(target, "")
-                            keyword_posts.append(cleaned)
-                        keyword_posts.sort(key=lambda p: p["timestampMs"], reverse=True)
-                    yield "data: " + json.dumps({
-                        "status": "keywordResults",
-                        "posts": keyword_posts,
-                        "total": len(keyword_posts),
-                    }) + "\n\n"
+                # One actor run per keyword — a single call with the whole list
+                # only ever searches the first keyword.
+                raw_rows, kw_report = scrapers.sweep_keywords(
+                    client, keywords, kw_date, per_keyword
+                )
+                unique, extras = scrapers.dedupe_keyword_results(raw_rows)
+                post_urls = [r["post_url"] for r in unique if r.get("post_url")]
+                if post_urls:
+                    yield "data: " + json.dumps({"status": "running", "step": f"Fetching content for {len(post_urls)} unique keyword posts…"}) + "\n\n"
+                    content_posts = scrapers.fetch_post_content(client, post_urls)
+                    url_to_kw = {scrapers.normalize_post_url(r.get("post_url", "")): r.get("keyword", "")
+                                 for r in unique}
+                    for p in content_posts:
+                        cleaned = clean_post(p)
+                        query = p.get("query") or {}
+                        target = query.get("targetUrl", "") if isinstance(query, dict) else ""
+                        key = scrapers.normalize_post_url(target) or scrapers.normalize_post_url(cleaned.get("postUrl", ""))
+                        cleaned["keyword"] = url_to_kw.get(key, "")
+                        others = [k for k in extras.get(key, []) if k and k != cleaned["keyword"]]
+                        cleaned["alsoMatchedKeywords"] = ", ".join(others)
+                        keyword_posts.append(cleaned)
+                    keyword_posts.sort(key=lambda p: p.get("timestampMs", 0), reverse=True)
+                yield "data: " + json.dumps({
+                    "status": "keywordResults",
+                    "posts": keyword_posts,
+                    "total": len(keyword_posts),
+                    "report": kw_report,
+                }) + "\n\n"
             except Exception as e:
                 yield "data: " + json.dumps({"status": "keywordResults", "posts": [], "total": 0, "error": str(e)}) + "\n\n"
 
         # ── 3. Combo: Profile posts filtered by keywords ────────────────
         if profiles and keywords:
             yield "data: " + json.dumps({"status": "running", "step": "Filtering profile posts by keywords…"}) + "\n\n"
-            keyword_lower = [k.lower() for k in keywords]
+            patterns = compile_keyword_patterns(keywords)
             for p in profile_posts_raw:
-                text = (p.get("content") or p.get("text") or p.get("description") or "").lower()
+                text = p.get("content") or p.get("text") or p.get("description") or ""
                 if not text:
                     continue
-                matched = []
-                for kw in keyword_lower:
-                    if kw in text:
-                        matched.append(kw)
-                    else:
-                        words = [w for w in kw.split() if len(w) > 3]
-                        if words and all(w in text for w in words):
-                            matched.append(kw)
+                matched = match_keywords(text, patterns)
                 if matched:
                     cleaned = clean_post(p)
                     cleaned["keyword"] = ", ".join(matched[:3])
                     combo_posts.append(cleaned)
-            combo_posts.sort(key=lambda p: p["timestampMs"], reverse=True)
+            combo_posts.sort(key=lambda p: p.get("timestampMs", 0), reverse=True)
             yield "data: " + json.dumps({
                 "status": "comboResults",
                 "posts": combo_posts,

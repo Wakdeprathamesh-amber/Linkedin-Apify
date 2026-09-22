@@ -1,10 +1,12 @@
 services:
   - type: web
-    name: linkedin-post-scraper
+    name: linkedin-apify
     runtime: python
     plan: free
     buildCommand: pip install -r requirements.txt
-    # gthread worker + long timeout so streaming (SSE) scrape runs don't get killed
+    # --workers 1 is LOAD-BEARING: the background job registry (jobs.py) lives in
+    # process memory, so a second worker would not see running sweeps.
+    # gthread + long timeout so streaming (SSE) scrape runs don't get killed.
     startCommand: gunicorn app:app --workers 1 --threads 8 --worker-class gthread --timeout 600 --bind 0.0.0.0:$PORT
     healthCheckPath: /health
     envVars:
@@ -13,11 +15,12 @@ services:
       # Generated automatically by Render — used to sign session cookies
       - key: SECRET_KEY
         generateValue: true
-      # Login credentials (change these for production)
+      # Login credentials — set both in the Render dashboard, never in this file
+      # (this repo is public). The app refuses to boot without APP_PASSWORD.
       - key: APP_USERNAME
-        value: Amber
+        sync: false
       - key: APP_PASSWORD
-        value: Amber@123
+        sync: false
       # Secrets — set these in the Render dashboard (sync:false = not stored in repo)
       - key: APIFY_API_TOKEN
         sync: false
