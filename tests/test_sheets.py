@@ -99,3 +99,69 @@ def test_report_marks_zero_result_keywords_as_duds():
     assert report[2][3] == "no results"
     assert report[3][3] == "failed"
     assert report[3][4] == "timeout"
+
+
+# ─── Archive column alignment ───────────────────────────────────────────────
+# The row shape changed once already: `alsoMatchedKeywords` was added after
+# `keyword`, so a positional append pushed scrapeDate one column to the right
+# for every new row while older rows stayed put.
+
+LEGACY_HEADER = [
+    "authorName", "postedAt", "text", "postUrl",
+    "reactions", "comments", "shares", "keyword", "scrapeDate",
+]
+CURRENT_HEADER = [
+    "authorName", "postedAt", "text", "postUrl",
+    "reactions", "comments", "shares", "keyword", "alsoMatchedKeywords", "scrapeDate",
+]
+
+
+def test_new_column_is_appended_without_moving_existing_ones():
+    header, _ = sheets.align_rows_to_header(LEGACY_HEADER, CURRENT_HEADER, [])
+    # Existing columns keep their index, so rows already archived stay valid.
+    assert header[:9] == LEGACY_HEADER
+    assert header[9] == "alsoMatchedKeywords"
+
+
+def test_scrapedate_lands_under_scrapedate_not_under_the_new_column():
+    """The actual drift: scrapeDate is index 9 incoming but index 8 in the
+    archive. A positional append filed it under alsoMatchedKeywords."""
+    row = ["Ada", "2d", "text", "https://x/1", "5", "1", "0", "btr", "cas, sh", "2026-09-22"]
+    header, aligned = sheets.align_rows_to_header(LEGACY_HEADER, CURRENT_HEADER, [row])
+    out = dict(zip(header, aligned[0]))
+    assert out["scrapeDate"] == "2026-09-22"
+    assert out["alsoMatchedKeywords"] == "cas, sh"
+    assert out["keyword"] == "btr"
+
+
+def test_missing_column_becomes_blank_not_a_shift():
+    """A row written under the legacy header must not slide scrapeDate left."""
+    row = ["Ada", "2d", "text", "https://x/1", "5", "1", "0", "btr", "2026-09-22"]
+    header, aligned = sheets.align_rows_to_header(CURRENT_HEADER, LEGACY_HEADER, [row])
+    out = dict(zip(header, aligned[0]))
+    assert out["scrapeDate"] == "2026-09-22"
+    assert out["alsoMatchedKeywords"] == ""
+
+
+def test_short_row_does_not_raise():
+    header, aligned = sheets.align_rows_to_header(
+        LEGACY_HEADER, CURRENT_HEADER, [["Ada", "2d"]]
+    )
+    assert len(aligned[0]) == len(header)
+    assert aligned[0][-1] == ""
+
+
+def test_identical_headers_are_left_alone():
+    row = ["Ada", "2d", "text", "https://x/1", "5", "1", "0", "btr", "", "2026-09-22"]
+    header, aligned = sheets.align_rows_to_header(CURRENT_HEADER, CURRENT_HEADER, [row])
+    assert header == CURRENT_HEADER
+    assert aligned[0] == row
+
+
+def test_headerless_legacy_archive_is_detected():
+    """A data row must not be mistaken for a header, or rows get aligned
+    against garbage. Detection is by overlap with known column names."""
+    data_row = ["Ada", "2d", "some post text", "https://x/1", "5", "1", "0", "btr", "2026-09-01"]
+    assert sheets.looks_like_header(data_row, CURRENT_HEADER) is False
+    assert sheets.looks_like_header(LEGACY_HEADER, CURRENT_HEADER) is True
+    assert sheets.looks_like_header([], CURRENT_HEADER) is False
