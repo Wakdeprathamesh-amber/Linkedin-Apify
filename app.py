@@ -274,8 +274,16 @@ def logout():
 
 @app.route("/health")
 def health():
-    """Unauthenticated health check for Render."""
-    return jsonify({"status": "ok"})
+    """Unauthenticated health check for Render.
+
+    Reports the deployed commit so a deploy can be confirmed from outside
+    without logging in — otherwise a successful health check only proves that
+    *some* revision is up, not which one. RENDER_GIT_COMMIT is set by Render.
+    """
+    return jsonify({
+        "status": "ok",
+        "commit": os.environ.get("RENDER_GIT_COMMIT", "")[:7],
+    })
 
 
 @app.route("/")

@@ -101,6 +101,42 @@ def filter_already_archived(existing: list, new_rows: list, url_field: str = "po
     return kept
 
 
+def looks_like_header(row: list, known_columns: list) -> bool:
+    """True when `row` holds column names rather than data.
+
+    Archives written before the header fix start straight in on data, so there
+    is nothing to align against and we fall back to a positional append.
+    """
+    cells = {str(c).strip() for c in (row or [])}
+    return bool(cells & set(known_columns))
+
+
+def align_rows_to_header(archive_header: list, incoming_header: list, rows: list):
+    """Remap rows written under `incoming_header` onto the archive's column order.
+
+    Rows used to be appended positionally, so when `alsoMatchedKeywords` was
+    added after `keyword` every column to its right shifted by one: scrapeDate
+    landed in the old alsoMatchedKeywords slot. Matching by name instead means a
+    column can be added later without disturbing rows already archived.
+
+    Columns the archive lacks are appended on the right, so existing rows keep
+    their alignment. Returns (header, aligned_rows).
+    """
+    header = list(archive_header)
+    for column in incoming_header:
+        if column not in header:
+            header.append(column)
+
+    position = {column: i for i, column in enumerate(incoming_header)}
+    aligned = []
+    indices = [position.get(column) for column in header]
+    for row in rows:
+        aligned.append([
+            row[i] if i is not None and i < len(row) else "" for i in indices
+        ])
+    return header, aligned
+
+
 def build_keyword_report(entries: list, today: str) -> list:
     """Per-keyword outcome table — the evidence base for pruning the list."""
     block = [["keyword", "found", "kept", "status", "error", "lastRun"]]
@@ -163,7 +199,20 @@ def export_to_sheet(sheet_url: str, rows: list, sheet_name: str = None):
             if data_rows:
                 if is_effectively_empty(archive_values):
                     archive_ws.append_rows([header] + data_rows, value_input_option="RAW")
+                elif looks_like_header(archive_values[0], header):
+                    # Align by column name: the row shape has already changed
+                    # once, and a positional append silently shifts every
+                    # column to the right of the new one.
+                    final_header, aligned = align_rows_to_header(
+                        archive_values[0], header, data_rows
+                    )
+                    if final_header != archive_values[0]:
+                        archive_ws.update(values=[final_header], range_name="A1")
+                    archive_ws.append_rows(aligned, value_input_option="RAW")
                 else:
+                    # Headerless legacy archive — nothing to align against.
+                    # Run /api/repair-archives to label it; appends after that
+                    # are aligned by name.
                     archive_ws.append_rows(data_rows, value_input_option="RAW")
 
     # ── 2. Overwrite the current tab with the fresh run ────────────────────
