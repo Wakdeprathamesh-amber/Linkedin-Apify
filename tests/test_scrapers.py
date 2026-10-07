@@ -191,6 +191,17 @@ def test_keyword_run_timeout_respects_the_actors_minimum():
     assert scrapers.KEYWORD_RUN_TIMEOUT_S >= 300
 
 
+def test_keyword_run_timeout_clears_observed_runtimes():
+    """300s is what the actor *accepts*, not what it needs.
+
+    The actor slowed ~3x between Sept and Oct 2026 (97-132s -> 293-320s). At a
+    300s timeout, two of three keywords were killed at the limit having produced
+    nothing, while still costing an actor start each. Keep real headroom over the
+    ~320s runs now take so a slow keyword is not silently dropped.
+    """
+    assert scrapers.KEYWORD_RUN_TIMEOUT_S >= 600
+
+
 def test_per_run_charge_cap_meets_apifys_floor():
     """Apify rejects a per-run cap below $0.70 with max-total-charge-usd-below-minimum."""
     assert float(scrapers.MAX_CHARGE_PER_RUN_USD) >= 0.70

@@ -20,15 +20,24 @@ DEDUPE_FACTOR = 0.85                  # observed unique-post ratio across keywor
 
 # Apify rejects any per-run cap below $0.70.
 MAX_CHARGE_PER_RUN_USD = Decimal("0.70")
-# The keyword actor refuses anything under 300s ("Low timeout! 300 sec is the
-# minimum."), so this is the floor, not a preference. Observed runs finish in
-# 75-110s, leaving ~3x headroom before a hung keyword is killed.
-KEYWORD_RUN_TIMEOUT_S = 300
+# The actor refuses anything under 300s ("Low timeout! 300 sec is the minimum."),
+# so 300 is the floor it will accept — but it is NOT a safe value to use.
+#
+# The actor slowed down roughly 3x between Sept and Oct 2026:
+#   2026-09-15:  97s,  97s, 132s   — all succeeded
+#   2026-10-07: 293s, 300s, 300s   — two killed at the limit, 0 items each
+# A keyword killed at 300s still costs an actor start, so a tight timeout burns
+# money and returns nothing. Re-running one of the killed keywords with 900s
+# succeeded in 319s, which confirmed the timeout was the only cause.
+#
+# 900s leaves ~3x headroom over the ~320s runs now take. Revisit if the actor
+# speeds up again; the Keyword Report tab shows timed-out keywords per run.
+KEYWORD_RUN_TIMEOUT_S = 900
 CONTENT_CHUNK_SIZE = 200
 # Account cap is 32 concurrent jobs, shared with another project on this token.
-# Measured: one keyword run takes 75-135s, so throughput is roughly
-# CONCURRENCY keywords per ~130s -> 295 keywords at 12 concurrent is ~55 minutes.
-DEFAULT_CONCURRENCY = 12
+# At ~320s per keyword run, throughput is CONCURRENCY keywords per ~320s, so
+# 295 keywords at 16 concurrent is ~1.6 hours (was ~55 min at the old speed).
+DEFAULT_CONCURRENCY = 16
 
 SUCCESS_STATUS = "SUCCEEDED"
 

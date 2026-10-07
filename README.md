@@ -143,9 +143,9 @@ call therefore spends the entire budget on keyword #1 — which is why only one
 keyword was ever searched. The app now issues **one actor run per keyword**,
 fanned out 8 at a time.
 
-A full 295-keyword sweep takes **about an hour** (measured: 75-135s per keyword
-run, 12 running concurrently), far past the 600s request timeout, so it runs as
-a background job:
+A full 295-keyword sweep takes **about 1.5-2 hours** (measured Oct 2026: ~320s
+per keyword run, 16 running concurrently), far past the 600s request timeout, so
+it runs as a background job:
 
 | Endpoint | Purpose |
 |----------|---------|
@@ -171,6 +171,12 @@ not how deep you go (~$0.044 each). Stage 2 is ~$0.0015 per post fetched. A
 
 A pre-flight guard refuses to start a sweep that would consume more than 90% of
 the Apify monthly allowance still remaining.
+
+> **Watch the actor's speed.** Keyword runs took 75-135s in Sept 2026 and
+> ~290-320s by Oct 2026. `KEYWORD_RUN_TIMEOUT_S` must stay comfortably above
+> whatever they currently take: a keyword killed at the timeout still costs an
+> actor start and returns nothing. The `Keyword Report` tab lists any keyword
+> that timed out, so a creeping slowdown shows up there first.
 
 ### Output tabs
 
